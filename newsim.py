@@ -113,6 +113,10 @@ if LIVE_ANIM and rank == 0:
             fig_tmp, ax_tmp = plt.subplots(num=f"{name} live")
             ax_S[name] = ax_tmp
 
+        fig_O2,  ax_O2  = plt.subplots(num="O2 live")
+        fig_GLC, ax_GLC = plt.subplots(num="Glucose live")
+        fig_LAC, ax_LAC = plt.subplots(num="Lactate live")
+
 # spatially‑varying first‑order rate  k(x)  (zero on inlet half, ramps to K_REACT)
 k_expr = Expression("x[0] <= xc ? 0.0 : k0*(x[0]-xc)/(Lx-xc)",
                     k0=K_REACT, xc=XC_REACT, Lx=Lx, degree=1)
@@ -176,6 +180,20 @@ G_inlet = 1.0e-3           # M   (1 mM total glutathione)
 k_NOX   = 5.0e-7           # mol m⁻³ s⁻¹   (wall‑adjacent volumetric rate)
 k_GSH   = 1.0e6            # M⁻¹ s⁻¹        (bi‑molecular)
 
+# --- metabolic layer (Level‑4) ------------------------------------
+D_O2   = 2.0e-9   # m²/s
+D_GLC  = 1.0e-9
+D_LAC  = 1.2e-9
+
+O2_inlet  = 0.21*1.3e-3      # Henry‑law ~0.27 mM at 1 atm
+GLC_inlet = 5.0e-3           # 5 mM glucose
+LAC_inlet = 0.0
+
+# simple first‑order uptake / production until real kinetics are fitted
+k_O2_uptake  = 1.0e-2        # s⁻¹
+k_GLC_uptake = 2.0e-2        # s⁻¹
+k_LAC_prod   = 2.0e-2        # s⁻¹  (stoichiometric with glucose)
+
 DT      = 0.02             # s
 N_STEPS = 400
 
@@ -188,6 +206,11 @@ S   = {n: Function(Vsc) for n in SENSOR_NAMES}
 S_n = {n: Function(Vsc) for n in SENSOR_NAMES}
 dS  = TrialFunction(Vsc)
 
+# metabolic species
+O2,  O2_n   = Function(Vsc), Function(Vsc)
+GLC, GLC_n  = Function(Vsc), Function(Vsc)
+LAC, LAC_n  = Function(Vsc), Function(Vsc)
+
 test = TestFunction(Vsc)
 dH   = TrialFunction(Vsc)
 dG   = TrialFunction(Vsc)
@@ -195,6 +218,10 @@ dG   = TrialFunction(Vsc)
 # inlet Dirichlet BCs
 bc_H_in = DirichletBC(Vsc, Constant(H_inlet), inlet)
 bc_G_in = DirichletBC(Vsc, Constant(G_inlet), inlet)
+
+bc_O2_in  = DirichletBC(Vsc, Constant(O2_inlet),  inlet)
+bc_GLC_in = DirichletBC(Vsc, Constant(GLC_inlet), inlet)
+bc_LAC_in = DirichletBC(Vsc, Constant(LAC_inlet), inlet)
 
 # NOX volumetric source   S_NOX = k_NOX * step(y)
 nox_src = Expression("x[1]>0.9*Ly ? kN : 0.0", degree=1, Ly=Ly, kN=k_NOX)
@@ -207,11 +234,16 @@ a_G  = (dG*test + DT*D_GSH *dot(grad(dG), grad(test)) + DT*k_GSH*H_n*dG*test)*dx
 a_H += ( DT*tau_supg*dot(u_, grad(test))*dot(u_, grad(dH)) )*dx
 a_G += ( DT*tau_supg*dot(u_, grad(test))*dot(u_, grad(dG)) )*dx
 
+# O2, Glucose, Lactate weak forms (no SUPG yet for simplicity)
+a_O2  = (TrialFunction(Vsc)*test + DT*D_O2 * dot(grad(TrialFunction(Vsc)), grad(test))) * dx
+a_GLC = (TrialFunction(Vsc)*test + DT*D_GLC * dot(grad(TrialFunction(Vsc)), grad(test))) * dx
+a_LAC = (TrialFunction(Vsc)*test + DT*D_LAC * dot(grad(TrialFunction(Vsc)), grad(test))) * dx
+
 # --- aggregate metrics CSV ----------------------------------------
 AREA = assemble(Constant(1.0)*dx_mesh)
 if rank == 0:
     metrics_f = open(OUT / "metrics.csv", "w")
-    metrics_f.write("t,H_mean,G_mean," + ",".join([f"{n}_mean" for n in SENSOR_NAMES]) + ",TEER_norm,LDH_flux\n")
+    metrics_f.write("t,H_mean,G_mean," + ",".join([f"{n}_mean" for n in SENSOR_NAMES]) + ",TEER_norm,LDH_flux,O2_mean,GLC_mean,LAC_mean\n")
 
 for n in range(N_STEPS):
     # ----- update H2O2 ---------------------------------------------------
@@ -229,16 +261,40 @@ for n in range(N_STEPS):
         solve(a_S == L_S, S[name])
         S_n[name].assign(S[name])
 
+    # ----- update metabolic species ---------------------------------
+    L_O2  = ((O2_n  - DT*dot(u_, grad(O2_n))  - DT*k_O2_uptake*O2_n)  * test) * dx
+    solve(a_O2  == L_O2,  O2,  bcs=[bc_O2_in])
+
+    L_GLC = ((GLC_n - DT*dot(u_, grad(GLC_n)) - DT*k_GLC_uptake*GLC_n) * test) * dx
+    solve(a_GLC == L_GLC, GLC, bcs=[bc_GLC_in])
+
+    L_LAC = ((LAC_n - DT*dot(u_, grad(LAC_n)) + DT*k_LAC_prod*GLC_n) * test) * dx
+    solve(a_LAC == L_LAC, LAC, bcs=[bc_LAC_in])
+
+    O2_n.assign(O2)
+    GLC_n.assign(GLC)
+    LAC_n.assign(LAC)
+
     # write metrics every 5 steps
     if rank == 0 and n % 5 == 0:
         H_mean = assemble(H*dx_mesh)/AREA
         G_mean = assemble(G*dx_mesh)/AREA
         sensor_means = [assemble(S[name]*dx_mesh)/AREA for name in SENSOR_NAMES]
-        TEER_norm = max(0.0, 1.0 - 1e6*H_mean)   # placeholder model
-        LDH_flux = 1e6*H_mean                   # placeholder model
+
+        O2_mean  = assemble(O2 *dx_mesh)/AREA
+        GLC_mean = assemble(GLC*dx_mesh)/AREA
+        LAC_mean = assemble(LAC*dx_mesh)/AREA
+
+        # literature‑fit: IC50_TEER ≈ 100 µM H2O2 (Caco‑2, Salvianolic‑B study) citeturn0search8
+        IC50_TEER = 1.0e-4   # M
+        TEER_norm = 1.0 / (1.0 + (H_mean/IC50_TEER)**2)
+
+        # LDH release: linear above 50 µM peroxide (hippocampal study) citeturn0search11
+        LDH_flux = max(0.0, (H_mean - 5.0e-5) * 5.0e6)   # arbitrary scaling to match % release
+
         metrics_f.write(f"{n*DT:.2f},{H_mean:.6e},{G_mean:.6e}," +
                         ",".join([f"{m:.6e}" for m in sensor_means]) +
-                        f",{TEER_norm:.6e},{LDH_flux:.6e}\n")
+                        f",{TEER_norm:.6e},{LDH_flux:.6e},{O2_mean:.6e},{GLC_mean:.6e},{LAC_mean:.6e}\n")
 
     H_n.assign(H)
     G_n.assign(G)
@@ -260,6 +316,15 @@ for n in range(N_STEPS):
             plt.sca(ax_S[name])
             plot(S[name], cmap="viridis")
             ax_S[name].set_title(f"{name}  t={n*DT:.1f}s")
+
+        for ax_, field_, title_ in [(ax_O2,  O2,  "O2"),
+                                    (ax_GLC, GLC, "Glc"),
+                                    (ax_LAC, LAC, "Lac")]:
+            ax_.clear()
+            plt.sca(ax_)
+            plot(field_, cmap="viridis")
+            ax_.set_title(f"{title_}  t={n*DT:.1f}s")
+
         plt.pause(0.001)
 
     if n % 40 == 0 and rank == 0:
